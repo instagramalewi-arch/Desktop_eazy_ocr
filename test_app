@@ -1,0 +1,761 @@
+"""
+Arabic OCR Desktop Application
+================================
+Supports two input modes (auto-detected):
+  • Folder of PDF files  → converted to images → OCR → Excel
+  • Folder of images     → OCR directly         → Excel
+
+Requirements: See requirements.txt
+Run: python ocr_app.py
+"""
+
+import os
+import re
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# Heavy libraries (easyocr, pdf2image, pandas, PIL) are imported lazily
+# inside the worker thread so the GUI launches instantly.
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+PDF_EXTENSION    = ".pdf"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXTRACTION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_value_before(lines: list, keyword: str) -> str:
+    """Return the line BEFORE the line containing *keyword* (fallback: line after)."""
+    for i, line in enumerate(lines):
+        if keyword in line:
+            if i > 0:
+                return lines[i - 1].strip()
+            elif i < len(lines) - 1:
+                return lines[i + 1].strip()
+    return ""
+
+
+def parse_birth_info(birth_text: str):
+    """Split a birth line into (place, year)."""
+    place, year = "", ""
+    if birth_text:
+        parts = birth_text.split()
+        if parts:
+            place = parts[0]
+        m = re.search(r'\d{4}', birth_text)
+        if m:
+            year = m.group()
+    return place, year
+
+
+def extract_fields(lines: list) -> dict:
+    """Map OCR lines to target Arabic fields via keyword search."""
+    birth_text    = get_value_before(lines, "الولادة")
+    place, date   = parse_birth_info(birth_text)
+    return {
+        "الرقم الوطني":     get_value_before(lines, "الرقم"),
+        "الاسم":            get_value_before(lines, "الاسم"),
+        "النسبة":           get_value_before(lines, "النسبة"),
+        "اسم الاب":         get_value_before(lines, "الأب"),
+        "اسم الجد":         get_value_before(lines, "الجد"),
+        "اسم الام ونسبتها": get_value_before(lines, "الأم"),
+        "مكان الولادة":     place,
+        "تاريخ الولادة":    date,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OCR HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ocr_image(image_obj, reader, log_fn, temp_path: str = "temp_ocr_page.png") -> list:
+    """
+    Enhance a PIL image, save to temp file, run EasyOCR, return text lines.
+    *image_obj* can be a PIL Image OR a file path string.
+    """
+    from PIL import Image, ImageEnhance
+
+    if not hasattr(Image, "ANTIALIAS"):
+        Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+    # Load from path if a string was passed
+    if isinstance(image_obj, str):
+        img = Image.open(image_obj).convert("RGB")
+    else:
+        img = image_obj.convert("RGB")
+
+    # Contrast enhancement
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img.save(temp_path)
+
+    result = reader.readtext(
+        temp_path,
+        detail=1,
+        paragraph=False,
+        text_threshold=0.1,
+        low_text=0.2,
+        contrast_ths=0.1,
+    )
+
+    lines = [det[1].strip() for det in result if det[1].strip()]
+
+    # Clean up temp file
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INPUT DISCOVERY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def discover_inputs(folder: str):
+    """
+    Scan *folder* and return (mode, pdfs, images).
+
+    mode = "both"  → folder has PDFs AND images  → process all
+    mode = "pdf"   → folder has PDFs only
+    mode = "image" → folder has images only
+    mode = "empty" → nothing found
+    """
+    all_files = os.listdir(folder)
+    pdfs   = sorted(f for f in all_files if f.lower().endswith(PDF_EXTENSION))
+    images = sorted(f for f in all_files
+                    if os.path.splitext(f.lower())[1] in IMAGE_EXTENSIONS)
+
+    if pdfs and images:
+        return "both", pdfs, images
+    if pdfs:
+        return "pdf", pdfs, []
+    if images:
+        return "image", [], images
+    return "empty", [], []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POPPLER AUTO-DETECT
+# ══════════════════════════════════════════════════════════════════════════════
+
+import sys
+import os
+
+def get_poppler_path() -> str:
+    if getattr(sys, "frozen", False):
+        # When running as .exe (PyInstaller)
+        base = sys._MEIPASS
+        return os.path.join(base, "poppler", "bin")
+    else:
+        # Development — your local poppler path
+        return r"C:\Users\ASUS\Downloads\Release-25.12.0-0\poppler-25.12.0\Library\bin"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PER-FILE PROCESSORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_pdf(pdf_path: str, reader, poppler_path, log_fn) -> list:
+    """Convert a PDF to images, OCR each page, return list of row dicts."""
+    from pdf2image import convert_from_path
+
+    filename = os.path.basename(pdf_path)
+    rows     = []
+
+    convert_kwargs = {"pdf_path": pdf_path, "dpi": 300}
+    if poppler_path:
+        convert_kwargs["poppler_path"] = poppler_path
+
+    try:
+        pages = convert_from_path(**convert_kwargs)
+    except Exception as exc:
+        log_fn(f"  ✗ Cannot convert {filename}: {exc}", error=True)
+        return []
+
+    for page_num, page_img in enumerate(pages, start=1):
+        label = f"{filename} – page {page_num}"
+        log_fn(f"  OCR: {label}")
+        try:
+            lines = ocr_image(page_img, reader, log_fn)
+            row   = {"اسم الملف": filename}
+            row.update(extract_fields(lines))
+            rows.append(row)
+        except Exception as exc:
+            log_fn(f"  ✗ OCR failed on {label}: {exc}", error=True)
+
+    return rows
+
+
+def process_image(image_path: str, reader, log_fn) -> list:
+    """OCR a single image file, return a list with one row dict."""
+    filename = os.path.basename(image_path)
+    log_fn(f"  OCR: {filename}")
+    try:
+        lines = ocr_image(image_path, reader, log_fn)
+        row   = {"اسم الملف": filename}
+        row.update(extract_fields(lines))
+        return [row]
+    except Exception as exc:
+        log_fn(f"  ✗ OCR failed on {filename}: {exc}", error=True)
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_pipeline(input_folder: str, output_folder: str,
+                 poppler_path, log_fn, progress_fn, done_fn):
+    """
+    Auto-detect input type (PDF or image), process all files, save Excel.
+    Runs in a background thread.
+    """
+    try:
+        import easyocr
+        import pandas as pd
+    except ImportError as exc:
+        log_fn(f"Missing dependency: {exc}\nRun: pip install {exc.name}", error=True)
+        done_fn(success=False)
+        return
+
+    # ── Discover inputs ─────────────────────────────────────────────
+    mode, pdfs, images = discover_inputs(input_folder)
+
+    if mode == "empty":
+        log_fn("No PDF or image files found in the selected folder.", error=True)
+        done_fn(success=False)
+        return
+
+    # ── Report what was found ─────────────────────────────────────────────
+    if mode == "both":
+        log_fn(f"📄🖼️  Mixed mode  —  {len(pdfs)} PDF(s)  +  {len(images)} image(s).")
+        log_fn("Processing PDFs first, then images…\n")
+    elif mode == "pdf":
+        log_fn(f"📄 PDF mode  —  {len(pdfs)} PDF file(s).")
+        log_fn("Converting PDFs to images then running OCR…\n")
+    else:
+        log_fn(f"🖼️  Image mode  —  {len(images)} image file(s).")
+        log_fn("Running OCR directly on images…\n")
+
+    # ── Initialise EasyOCR (once) ─────────────────────────────────────────────
+    log_fn("Loading OCR engine (first run may take a moment)…")
+    try:
+        reader = easyocr.Reader(['ar'], gpu=False)
+    except Exception as exc:
+        log_fn(f"Failed to load EasyOCR: {exc}", error=True)
+        done_fn(success=False)
+        return
+    log_fn("OCR engine ready.\n")
+
+    # ── Build unified work list: (filepath, type) ────────────────────────────────────
+    # PDFs first, then images — all in one sequential list
+    work_list = [(os.path.join(input_folder, f), "pdf")   for f in pdfs] + \
+                [(os.path.join(input_folder, f), "image") for f in images]
+
+    # ── Process files ───────────────────────────────────────────────────────────────
+    all_rows = []
+    total    = len(work_list)
+
+    for idx, (filepath, ftype) in enumerate(work_list, start=1):
+        filename = os.path.basename(filepath)
+        log_fn(f"[{idx}/{total}] {filename}")
+
+        if ftype == "pdf":
+            rows = process_pdf(filepath, reader, poppler_path, log_fn)
+        else:
+            rows = process_image(filepath, reader, log_fn)
+
+        all_rows.extend(rows)
+        progress_fn(idx / total * 100)
+
+    # ── Save Excel ────────────────────────────────────────────────────────────
+    if not all_rows:
+        log_fn("\nNo data was extracted. Excel file not saved.", error=True)
+        done_fn(success=False)
+        return
+
+    col_order = [
+        "اسم الملف", "الرقم الوطني", "الاسم", "النسبة",
+        "اسم الاب", "اسم الجد", "اسم الام ونسبتها",
+        "مكان الولادة", "تاريخ الولادة",
+    ]
+    df          = pd.DataFrame(all_rows, columns=col_order)
+    output_path = os.path.join(output_folder, "output.xlsx")
+
+    try:
+        df.to_excel(output_path, index=False)
+        log_fn(f"\n✓ Done!  {len(all_rows)} record(s) saved to:\n  {output_path}",
+               success=True)
+        done_fn(success=True, output_path=output_path)
+    except Exception as exc:
+        log_fn(f"Failed to save Excel file: {exc}", error=True)
+        done_fn(success=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GUI THEME
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Palette ────────────────────────────────────────────────────────────────
+COLORS = {
+    # ── Backgrounds ───────────────────────────────
+    "bg":           "#002623",   # deepest dark green
+    "panel":        "#054239",   # dark forest green
+    "panel_alt":    "#23334B",   # navy (secondary panels)
+ 
+    # ── Accents / Interactive ──────────────────────
+    "accent":       "#428177",   # teal green
+    "accent2":      "#8E7B5B",   # warm gold-brown
+    "btn_hover":    "#054239",   # deep green on hover
+ 
+    # ── Gold tones ────────────────────────────────
+    "gold":         "#8E7B5B",   # primary gold
+    "gold_light":   "#988561",   # lighter gold
+    "gold_muted":   "#B1A27C",   # soft sand gold
+ 
+    # ── Status ────────────────────────────────────
+    "success":      "#428177",   # teal as success
+    "error":        "#F87171",
+ 
+    # ── Text & UI chrome ──────────────────────────
+    "text":         "#E2E8F0",
+    "muted":        "#94A3B8",
+    "border":       "#428177",   # teal border
+}
+ 
+FONT_TITLE = ("Segoe UI", 18, "bold")
+FONT_LABEL = ("Segoe UI", 10)
+FONT_BOLD  = ("Segoe UI", 10, "bold")
+FONT_MONO  = ("Consolas", 9)
+FONT_BTN   = ("Segoe UI", 11, "bold")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADD LOGO
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LOGO_B64 = "C:\\Users\\ASUS\\Desktop\\Asset 1.pdf"
+
+
+import tkinter as tk
+import base64
+from io import BytesIO
+from PIL import Image, ImageTk
+
+def get_logo(width: int = 300) -> ImageTk.PhotoImage:
+    """Return the HRD logo as a Tkinter-compatible PhotoImage, scaled to *width* px."""
+    data = base64.b64decode(_LOGO_B64)
+    img  = Image.open(BytesIO(data))
+    ratio = width / img.width
+    img   = img.resize((width, int(img.height * ratio)), Image.LANCZOS)
+    return ImageTk.PhotoImage(img)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOLTIP WIDGET
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text   = text
+        self.tip    = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _=None):
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, background="#2D2D50",
+                 foreground=COLORS["muted"], relief="flat",
+                 font=("Segoe UI", 8), padx=6, pady=3).pack()
+
+    def _hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OCRApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Arabic OCR Extractor")
+        self.resizable(True, True)
+        self.minsize(700, 600)
+        self.configure(bg=COLORS["bg"])
+
+        self.input_folder_var  = tk.StringVar()
+        self.output_folder_var = tk.StringVar()
+        self.poppler_path_var  = tk.StringVar(value=get_poppler_path() or "")
+        self.mode_label_var    = tk.StringVar(value="—")
+        self.is_running        = False
+
+        self._build_ui()
+        self._center_window(720, 660)
+
+        # Update mode badge whenever input folder changes
+        self.input_folder_var.trace_add("write", self._refresh_mode_badge)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg=COLORS["bg"], pady=18)
+        hdr.pack(fill="x", padx=30)
+        tk.Label(hdr, text="🔤  Arabic OCR Extractor",
+                 font=FONT_TITLE, bg=COLORS["bg"],
+                 fg=COLORS["accent2"]).pack(side="left")
+        tk.Label(hdr, text="PDF / Images → Excel",
+                 font=("Segoe UI", 9), bg=COLORS["bg"],
+                 fg=COLORS["muted"]).pack(side="left", padx=(10, 0), pady=(6, 0))
+
+        tk.Frame(self, bg=COLORS["border"], height=1).pack(fill="x", padx=20)
+
+        # Content area
+        content = tk.Frame(self, bg=COLORS["bg"], padx=30, pady=16)
+        content.pack(fill="both", expand=True)
+
+        self._build_folder_row(content, "Input Folder:",
+                               self.input_folder_var, self._browse_input, required=True)
+        self._build_folder_row(content, "Output Folder:",
+                               self.output_folder_var, self._browse_output,
+                               placeholder="Leave blank to use Input Folder")
+        self._build_poppler_row(content)
+
+        # ── Mode badge ────────────────────────────────────────────────────────
+        badge_row = tk.Frame(content, bg=COLORS["bg"], pady=4)
+        badge_row.pack(fill="x")
+        tk.Label(badge_row, text="Detected input type:",
+                 font=FONT_LABEL, bg=COLORS["bg"],
+                 fg=COLORS["muted"]).pack(side="left")
+        self.mode_badge = tk.Label(
+            badge_row, textvariable=self.mode_label_var,
+            font=FONT_BOLD, bg=COLORS["panel"],
+            fg=COLORS["accent2"], padx=10, pady=3, relief="flat")
+        self.mode_badge.pack(side="left", padx=(8, 0))
+        Tooltip(self.mode_badge,
+                "Auto-detected from folder contents.\n"
+                "PDFs take priority over images if both exist.")
+
+        # ── Progress ──────────────────────────────────────────────────────────
+        prog_frame = tk.Frame(content, bg=COLORS["bg"])
+        prog_frame.pack(fill="x", pady=(14, 4))
+        tk.Label(prog_frame, text="Progress", font=FONT_BOLD,
+                 bg=COLORS["bg"], fg=COLORS["muted"]).pack(anchor="w")
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Custom.Horizontal.TProgressbar",
+                        troughcolor=COLORS["panel"],
+                        background=COLORS["accent"],
+                        bordercolor=COLORS["border"],
+                        lightcolor=COLORS["accent"],
+                        darkcolor=COLORS["accent"])
+        self.progress_bar = ttk.Progressbar(
+            prog_frame, style="Custom.Horizontal.TProgressbar",
+            mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", pady=(4, 0))
+        self.progress_label = tk.Label(prog_frame, text="Idle",
+                                       font=FONT_MONO, bg=COLORS["bg"],
+                                       fg=COLORS["muted"])
+        self.progress_label.pack(anchor="e")
+
+        # ── Log console ───────────────────────────────────────────────────────
+        log_frame = tk.Frame(content, bg=COLORS["panel"],
+                             relief="flat", pady=10, padx=10)
+        log_frame.pack(fill="both", expand=True, pady=(6, 0))
+        tk.Label(log_frame, text="Log", font=FONT_BOLD,
+                 bg=COLORS["panel"], fg=COLORS["muted"]).pack(anchor="w")
+
+        log_scroll_frame = tk.Frame(log_frame, bg=COLORS["panel"])
+        log_scroll_frame.pack(fill="both", expand=True, pady=(4, 0))
+
+        self.log_text = tk.Text(
+            log_scroll_frame, font=FONT_MONO, bg=COLORS["panel"],
+            fg=COLORS["text"], insertbackground=COLORS["accent"],
+            relief="flat", bd=0, wrap="word", height=10,
+            state="disabled")
+        scrollbar = tk.Scrollbar(log_scroll_frame,
+                                 command=self.log_text.yview,
+                                 bg=COLORS["panel"],
+                                 troughcolor=COLORS["panel"],
+                                 relief="flat")
+        self.log_text["yscrollcommand"] = scrollbar.set
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        self.log_text.tag_config("error",   foreground=COLORS["error"])
+        self.log_text.tag_config("success", foreground=COLORS["success"])
+
+        # ── Bottom buttons ────────────────────────────────────────────────────
+        btn_row = tk.Frame(self, bg=COLORS["bg"], pady=14)
+        btn_row.pack(fill="x", padx=30)
+
+        self.start_btn = self._make_button(
+            btn_row, "▶  Start Processing", self._start, COLORS["accent"])
+        self.start_btn.pack(side="left")
+
+        self._make_button(btn_row, "Clear Log", self._clear_log,
+                          COLORS["panel"], fg=COLORS["muted"]).pack(
+            side="left", padx=(10, 0))
+
+        self.open_btn = self._make_button(
+            btn_row, "📂  Open Output", self._open_output,
+            COLORS["panel"], fg=COLORS["success"])
+        self.open_btn.pack(side="right")
+        self.open_btn.config(state="disabled")
+
+    # ── Row builders ──────────────────────────────────────────────────────────
+
+    def _build_folder_row(self, parent, label_text, var,
+                          command, required=False, placeholder=""):
+        row = tk.Frame(parent, bg=COLORS["bg"], pady=5)
+        row.pack(fill="x")
+
+        tk.Label(row, text=label_text, font=FONT_BOLD,
+                 bg=COLORS["bg"], fg=COLORS["text"],
+                 width=22, anchor="w").pack(side="left")
+
+        entry = tk.Entry(
+            row, textvariable=var, font=FONT_LABEL,
+            bg=COLORS["panel"],
+            fg=COLORS["text"] if not placeholder else COLORS["muted"],
+            insertbackground=COLORS["accent"], relief="flat", bd=6,
+            highlightthickness=1, highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"])
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        if placeholder and not var.get():
+            entry.insert(0, placeholder)
+            entry.config(fg=COLORS["muted"])
+
+            def _focus_in(_e, e=entry):
+                if e.get() == placeholder:
+                    e.delete(0, "end")
+                    e.config(fg=COLORS["text"])
+
+            def _focus_out(_e, e=entry):
+                if not e.get():
+                    e.insert(0, placeholder)
+                    e.config(fg=COLORS["muted"])
+
+            entry.bind("<FocusIn>",  _focus_in)
+            entry.bind("<FocusOut>", _focus_out)
+
+        tk.Button(row, text="Browse…", command=command,
+                  font=FONT_LABEL, bg=COLORS["border"],
+                  fg=COLORS["text"], relief="flat",
+                  activebackground=COLORS["accent"],
+                  activeforeground="white",
+                  padx=10, pady=4, cursor="hand2").pack(side="left")
+
+        if required:
+            tk.Label(row, text="*", font=FONT_BOLD,
+                     bg=COLORS["bg"], fg=COLORS["error"]).pack(side="left", padx=2)
+
+    def _build_poppler_row(self, parent):
+        row = tk.Frame(parent, bg=COLORS["bg"], pady=5)
+        row.pack(fill="x")
+
+        """  tk.Label(row, text="Poppler Path (Windows):",
+                 font=FONT_BOLD, bg=COLORS["bg"],
+                 fg=COLORS["text"], width=22, anchor="w").pack(side="left")
+
+        tk.Entry(row, textvariable=self.poppler_path_var,
+                 font=FONT_LABEL, bg=COLORS["panel"],
+                 fg=COLORS["text"], insertbackground=COLORS["accent"],
+                 relief="flat", bd=6, highlightthickness=1,
+                 highlightbackground=COLORS["border"],
+                 highlightcolor=COLORS["accent"]).pack(
+            side="left", fill="x", expand=True, padx=(0, 8)) 
+
+        tk.Button(row, text="Browse…", command=self._browse_poppler,
+                  font=FONT_LABEL, bg=COLORS["border"],
+                  fg=COLORS["text"], relief="flat",
+                  activebackground=COLORS["accent"],
+                  activeforeground="white",
+                  padx=10, pady=4, cursor="hand2").pack(side="left")  
+
+        note = tk.Label(row, text="ℹ", font=FONT_BOLD,
+                        bg=COLORS["bg"], fg=COLORS["accent2"],
+                        cursor="hand2")  
+        note.pack(side="left", padx=4) 
+        Tooltip(note,
+                "Only needed on Windows for PDF mode.\n"
+                "Leave blank on Linux/macOS (Poppler on PATH).\n"
+                "Download: github.com/oschwartz10612/poppler-windows") """
+
+    def _make_button(self, parent, text, command, bg, fg="white"):
+        btn = tk.Button(parent, text=text, command=command,
+                        font=FONT_BTN, bg=bg, fg=fg,
+                        activebackground=COLORS["btn_hover"],
+                        activeforeground="white",
+                        relief="flat", bd=0,
+                        padx=18, pady=8, cursor="hand2")
+        btn.bind("<Enter>", lambda _: btn.config(bg=COLORS["btn_hover"], fg="white"))
+        btn.bind("<Leave>", lambda _: btn.config(bg=bg, fg=fg))
+        return btn
+
+    # ── Mode badge ────────────────────────────────────────────────────────────
+
+    def _refresh_mode_badge(self, *_):
+        folder = self.input_folder_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.mode_label_var.set("—")
+            self.mode_badge.config(fg=COLORS["muted"])
+            return
+        mode, pdfs, images = discover_inputs(folder)
+        if mode == "both":
+            self.mode_label_var.set(f"📄🖼️  Mixed  —  {len(pdfs)} PDF(s) + {len(images)} image(s)")
+            self.mode_badge.config(fg=COLORS["accent2"])
+        elif mode == "pdf":
+            self.mode_label_var.set(f"📄  PDF mode  ({len(pdfs)} file(s))")
+            self.mode_badge.config(fg=COLORS["accent2"])
+        elif mode == "image":
+            self.mode_label_var.set(f"🖼️  Image mode  ({len(images)} file(s))")
+            self.mode_badge.config(fg=COLORS["success"])
+        else:
+            self.mode_label_var.set("⚠️  No PDFs or images found")
+            self.mode_badge.config(fg=COLORS["error"])
+
+    # ── Browse callbacks ──────────────────────────────────────────────────────
+
+    def _browse_input(self):
+        path = filedialog.askdirectory(title="Select Input Folder (PDFs or Images)")
+        if path:
+            self.input_folder_var.set(path)
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Select Output Folder")
+        if path:
+            self.output_folder_var.set(path)
+
+    def _browse_poppler(self):
+        path = filedialog.askdirectory(title="Select Poppler bin/ Folder")
+        if path:
+            self.poppler_path_var.set(path)
+
+    # ── Log helpers ───────────────────────────────────────────────────────────
+
+    def _log(self, message: str, error: bool = False, success: bool = False):
+        def _append():
+            self.log_text.config(state="normal")
+            tag = "error" if error else "success" if success else ""
+            self.log_text.insert("end", message + "\n", tag)
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        self.after(0, _append)
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+        self.progress_bar["value"] = 0
+        self.progress_label.config(text="Idle")
+
+    def _set_progress(self, value: float):
+        def _update():
+            self.progress_bar["value"] = value
+            self.progress_label.config(text=f"{value:.0f}%")
+        self.after(0, _update)
+
+    # ── Start / Done ──────────────────────────────────────────────────────────
+
+    def _start(self):
+        if self.is_running:
+            return
+
+        input_folder = self.input_folder_var.get().strip()
+        if not input_folder or not os.path.isdir(input_folder):
+            messagebox.showerror("Error", "Please select a valid Input Folder.")
+            return
+
+        # Quick check before launching thread
+        mode, pdfs, images = discover_inputs(input_folder)
+        if mode == "empty":
+            messagebox.showerror("Error",
+                                 "No PDF or image files found in the selected folder.")
+            return
+
+        # Output folder
+        PLACEHOLDER = "Leave blank to use Input Folder"
+        raw_out = self.output_folder_var.get().strip()
+        if raw_out in ("", PLACEHOLDER):
+            output_folder = input_folder
+        else:
+            os.makedirs(raw_out, exist_ok=True)
+            output_folder = raw_out
+
+        poppler_path = self.poppler_path_var.get().strip() or None
+        if poppler_path and not os.path.isdir(poppler_path):
+            if not messagebox.askyesno(
+                    "Poppler path not found",
+                    f"The Poppler path does not exist:\n{poppler_path}\n\n"
+                    "Continue anyway?"):
+                return
+
+        self.is_running = True
+        self.start_btn.config(state="disabled", text="⏳  Processing…")
+        self.open_btn.config(state="disabled")
+        self._clear_log()
+        self._log("Starting pipeline…", success=True)
+        self._last_output_path = os.path.join(output_folder, "output.xlsx")
+
+        threading.Thread(
+            target=run_pipeline,
+            args=(input_folder, output_folder, poppler_path,
+                  self._log, self._set_progress, self._on_done),
+            daemon=True
+        ).start()
+
+    def _on_done(self, success: bool = False, output_path: str = ""):
+        def _update():
+            self.is_running = False
+            self.start_btn.config(state="normal", text="▶  Start Processing")
+            if success:
+                self.open_btn.config(state="normal")
+                self._set_progress(100)
+        self.after(0, _update)
+
+    def _open_output(self):
+        path = getattr(self, "_last_output_path", "")
+        if path and os.path.isfile(path):
+            import subprocess, platform
+            if platform.system() == "Windows":
+                os.startfile(path)
+            elif platform.system() == "Darwin":
+                subprocess.call(["open", path])
+            else:
+                subprocess.call(["xdg-open", path])
+        else:
+            messagebox.showinfo("Not Found", "Output file not found yet.")
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+
+    def _center_window(self, w: int, h: int):
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    app = OCRApp()
+    app.mainloop()
